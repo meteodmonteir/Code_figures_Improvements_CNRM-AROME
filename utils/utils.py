@@ -5,11 +5,37 @@ import regionmask
 import pandas as pd
 import geopandas
 from scipy import stats
+# import statsmodels.api as sm
+# import xesmf as xe
 import pymannkendall as mk
-import xesmf as xe
-import statsmodels.api as sm
-import pymannkendall as mk
-from scipy.linalg import toeplitz
+# from scipy.linalg import toeplitz
+
+
+
+
+def mask_station_yrly_record_length(data,ls_years = [1960,2020], ls_month = [10,11,12,1,2,3,4,5,6], threshold = 90):
+    ls_month_name = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
+    station_record_length_yr = data.isel(time=data.time.dt.month.isin(ls_month))
+    days_per_yr = station_record_length_yr.time.dt.daysinmonth.resample(time = '1MS').mean().resample(time = 'A-'+ls_month_name[ls_month[0]-2],label = 'left',closed = 'left').sum().sel(time = slice(str(ls_years[0]),str(ls_years[-1])))
+    station_record_length_yr = station_record_length_yr.resample(time = 'A-'+ls_month_name[ls_month[0]-2],label = 'left',closed = 'left').count().sel(time = slice(str(ls_years[0]),str(ls_years[-1])))
+    station_record_length_yr = (station_record_length_yr/days_per_yr)*100
+    station_record_length_daily = station_record_length_yr.resample(time = "D").ffill()
+    return data.where(station_record_length_daily > threshold)
+
+
+def sel_station_total_record(data, ls_years = [1960,2020], ls_month = [10,11,12,1,2,3,4,5,6], threshold = 50):
+    data = data.sel(time = slice(str(ls_years[0]),str(ls_years[-1])))
+    station_record_length = (data.isel(time=data.time.dt.month.isin(ls_month)).count(dim = 'time')/len(data.time.isel(time=data.time.dt.month.isin(ls_month))))*100
+    station_record_length = station_record_length.where(station_record_length > threshold).dropna(dim = 'Station_Name')
+    return data.sel(Station_Name = station_record_length.Station_Name)
+
+def find_period_max_nb_obs(data, ls_years = [1960,2020], ls_month = [10,11,12,1,2,3,4,5,6], period = 30):
+    data = data.sel(time = slice(str(ls_years[0]),str(ls_years[-1])))
+    num_obs = data.isel(time=data.time.dt.month.isin(ls_month)).count(dim = 'Station_Name').resample(time = '1Y').mean().rolling(time =period,min_periods=period,center =False).mean()
+    ## Sel the densest XX-year period
+    year_densest = [num_obs.isel(time = num_obs.argmax()).time.dt.year.values-(period-1), num_obs.isel(time = num_obs.argmax()).time.dt.year.values]
+    return data.sel(time = slice(str(year_densest[0]), str(year_densest[1])))
+
 
 ####################################################################################################################
 
@@ -50,12 +76,34 @@ def adjust_lightness(color, amount=0.5):
 # Needs an orography as variable/coordinates (u can specify name with arg elevation_band)
 # ls_alt is the list of the boundary of each elevation slice
 
-def per_alt(data,ls_alt, elevation_label = 'ZS' ): # ls_alt = np.arange(0,4200,300) (for example)
+####################################################################################################################
+
+def per_alt(data,topo,ls_alt, elevation_label = 'ZS' ): # ls_alt = np.arange(0,4200,300) (for example)
     
-    data_per_alt = xr.concat([data.where((data[elevation_label] >= ls_alt[i])*(data[elevation_label] < ls_alt[i+1])) for i in range(0,len(ls_alt)-1)], dim = 'middle_slices_ZS')
+    data_per_alt = xr.concat([data.where((topo[elevation_label] >= ls_alt[i])*(topo[elevation_label] < ls_alt[i+1])) for i in range(0,len(ls_alt)-1)], dim = 'middle_slices_ZS')
     data_per_alt['middle_slices_ZS'] = ls_alt[1:] - (ls_alt[1] - ls_alt[0])/2
     
     return data_per_alt
+
+####################################################################################################################
+
+def per_slope(data,topo,ls_slope, slope_label = 'slope' ):
+
+    data_per_slope = xr.concat([data.where((topo[slope_label] >= ls_slope[i])*(topo[slope_label] < ls_slope[i+1])) for i in range(0,len(ls_slope)-1)], dim = 'mid_slope')
+    data_per_slope['mid_slope'] = ls_slope[1:] - (ls_slope[1] - ls_slope[0])/2
+    
+    return data_per_slope
+
+####################################################################################################################
+
+def per_aspect(data,topo, aspect_label = 'aspect' ):
+
+    ls_aspect = [22.5,  67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5]
+    ls_mid_aspect = np.arange(0,360,45)
+    data_per_aspect = xr.concat([data.where(((topo[aspect_label] >= 337.5)*(topo[aspect_label] < 360)) | ((topo[aspect_label] >= 0)*(topo[aspect_label] < 22.5)))]+[data.where((topo[aspect_label] >= ls_aspect[i])*(topo[aspect_label] < ls_aspect[i+1])) for i in range(0,len(ls_aspect)-1)], dim = 'mid_aspect')
+    data_per_aspect['mid_aspect'] = ls_mid_aspect
+    
+    return data_per_aspect
 
 ####################################################################################################################
 
@@ -151,8 +199,6 @@ def theilslopes(data, method = 'TS',seasonal = False, period = None):
 
     return data
 
-import pymannkendall as mk
-
 
 ####################################################################################################################
 
@@ -181,13 +227,15 @@ def sellonlatbox(ds,spatial_dim,lat_inf=43.5,lat_sup=49.5,lon_inf=4,lon_sup=18, 
 # Outputs are given as integer for SCD, and datetime for the SOD and SMOD
 
 def lcscd(data, threshold = 15):
+    mask = data.mean(dim = 'time')
     data = xr.where(data > threshold, True, False)
     cumulative = data.cumsum(dim='time')-data.cumsum(dim='time').where(data.values == 0).ffill(dim='time').fillna(0)
     scd = (cumulative.max(dim = 'time')).rename('scd')
     mod = (cumulative.idxmax(dim = 'time') + np.timedelta64(1,'D')).rename('mod')
     sod = (mod - scd.astype('timedelta64[D]')).rename('sod')
     sd = data.where(data == True, np.nan).count(dim = 'time').rename('sd')
-    return xr.merge([scd,mod,sod,sd])
+    data = xr.merge([scd,mod,sod,sd])
+    return data.where(~np.isnan(mask))
 
 ####################################################################################################################
 
@@ -214,6 +262,7 @@ def init_resampling(data_src,data_trgt, wf = lambda r: 1/r**2, neighbours = 25):
     ds = ds.rename({'lon':'rlon','lat':'rlat'})
     ds['lon'], ds['lat'] = data_trgt['lon'], data_trgt['lat']
     return ds
+
 
 ####################################################################################################################
 
